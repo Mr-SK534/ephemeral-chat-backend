@@ -6,63 +6,79 @@ const cors = require('cors');
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: "*", // Allow Vercel frontend
-    methods: ["GET", "POST"]
-  }
+  cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
 app.use(cors());
-app.get('/', (req, res) => {
-  res.send('Ephemeral Chat Backend - Running');
-});
+app.get('/', (req, res) => res.send('Ephemeral Chat Backend - Running'));
 
 const PORT = process.env.PORT || 3000;
 
-// In-memory storage: chatCode → { users: Set, messages: [] }
+// chatCode → { users: Set<socket.id>, names: Map<socket.id, name>, messages: [] }
 const chats = new Map();
 
 io.on('connection', (socket) => {
   let userRoom = null;
-  let username = 'Anonymous';
+  let username = 'guest';
 
+  // ---------- JOIN ----------
   socket.on('join', ({ code, username: name }) => {
     if (!code) return;
     userRoom = code;
-    username = name?.trim() || 'Anonymous';
+    username = name?.trim() || 'guest';
 
     if (!chats.has(code)) {
-      chats.set(code, { users: new Set(), messages: [] });
+      chats.set(code, { users: new Set(), names: new Map(), messages: [] });
     }
-
     const chat = chats.get(code);
     chat.users.add(socket.id);
+    chat.names.set(socket.id, username);
 
     socket.join(code);
     socket.to(code).emit('system message', `${username} joined`);
-    socket.emit('system message', `Welcome to chat: ${code}`);
+    socket.emit('system message', `Connected to ${code}. Type 'help'.`);
   });
 
+  // ---------- MESSAGE ----------
   socket.on('chat message', (msg) => {
     if (!userRoom || !msg?.trim()) return;
     const chat = chats.get(userRoom);
     if (!chat) return;
 
-    const messageData = { username, msg: msg.trim(), time: new Date() };
-    chat.messages.push(messageData);
+    const data = { username, msg: msg.trim(), time: new Date() };
+    chat.messages.push(data);
 
-    io.to(userRoom).emit('chat message', messageData);
+    io.to(userRoom).emit('chat message', data);
   });
 
+  // ---------- TYPING ----------
+  socket.on('typing', (isTyping) => {
+    if (!userRoom) return;
+    if (isTyping) {
+      socket.to(userRoom).emit('user typing', username);
+    }
+  });
+
+  // ---------- REQUEST USERS (who command) ----------
+  socket.on('request users', () => {
+    if (!userRoom) return;
+    const chat = chats.get(userRoom);
+    if (!chat) return;
+    const list = Array.from(chat.names.values()).join(', ') || 'nobody';
+    socket.emit('system message', `Online: ${list}`);
+  });
+
+  // ---------- DISCONNECT ----------
   socket.on('disconnect', () => {
     if (!userRoom) return;
     const chat = chats.get(userRoom);
     if (!chat) return;
 
     chat.users.delete(socket.id);
+    chat.names.delete(socket.id);
     socket.to(userRoom).emit('system message', `${username} left`);
 
-    // Auto-delete when empty
+    // AUTO-DELETE WHEN EMPTY
     if (chat.users.size === 0) {
       chats.delete(userRoom);
       io.to(userRoom).emit('chat closed');
@@ -71,7 +87,7 @@ io.on('connection', (socket) => {
   });
 });
 
-// Clean up stale chats every hour
+// CLEANUP STALE CHATS
 setInterval(() => {
   for (const [code, chat] of chats.entries()) {
     if (chat.users.size === 0) {
